@@ -23,6 +23,9 @@ $systemReport = @()
 $vmReport = @()
 $securityReport = @()
 $cpuTrendReport = @()
+$hardwareReport = @()
+$backupReport = @()
+$networkReport = @()
 
 foreach ($server in $Servers) {
     try {
@@ -43,13 +46,15 @@ foreach ($server in $Servers) {
         }
 
         # --- Hyper-V VM Monitoring ---
-        if ($vms = Get-VM -ComputerName $server -ErrorAction SilentlyContinue) {
-            $vmStats = $vms | Select-Object Name, State, Uptime,
-                @{n='CPUUsage';e={$_.CPUUsage}},
-                @{n='MemoryAssignedGB';e={[math]::Round($_.MemoryAssigned/1GB,2)}}
-
-            $vmReport += $vmStats | ConvertTo-Html -Fragment -PreContent "<h3>VM Performance - $server</h3>"
-        }
+        try {
+            $vms = Get-VM -ComputerName $server -ErrorAction Stop
+            if ($vms) {
+                $vmStats = $vms | Select-Object Name, State, Uptime,
+                    @{n='CPUUsage';e={$_.CPUUsage}},
+                    @{n='MemoryAssignedGB';e={[math]::Round($_.MemoryAssigned/1GB,2)}}
+                $vmReport += $vmStats | ConvertTo-Html -Fragment -PreContent "<h3>VM Performance - $server</h3>"
+            }
+        } catch {}
 
         # --- Security Events (last 24h) ---
         # Failed logons (4625)
@@ -116,6 +121,50 @@ foreach ($server in $Servers) {
         $cpuTrendReport += "<b>Peak CPU (last 1 min):</b> $peakCPU %<br>"
         $cpuTrendReport += $cpuSamples | ConvertTo-Html -Fragment
 
+        # --- Hardware Health ---
+        $hardwareHealth = @()
+        $hardwareHealth += Get-WmiObject Win32_Fan -ComputerName $server | Select-Object Name, Status, DesiredSpeed, CurrentSpeed
+        $hardwareHealth += Get-WmiObject Win32_TemperatureProbe -ComputerName $server | Select-Object Name, Status, CurrentReading
+        $hardwareHealth += Get-WmiObject Win32_Battery -ComputerName $server | Select-Object Name, Status, EstimatedChargeRemaining
+        $hardwareHealth += Get-WmiObject Win32_DiskDrive -ComputerName $server | Select-Object Model, Status
+
+        $hardwareReport += "<h3>Hardware Health - $server</h3>"
+        if ($hardwareHealth) {
+            $hardwareReport += $hardwareHealth | ConvertTo-Html -Fragment
+        } else {
+            $hardwareReport += "<p>No hardware health data available (requires vendor tools or agents).</p>"
+        }
+
+        # --- Backup Job Summaries ---
+        $backupResults = Get-WinEvent -ComputerName $server -LogName 'Microsoft-Windows-Backup' -MaxEvents 20 |
+            Where-Object { $_.Id -in 4,5,7,9 } | Select-Object TimeCreated, Id, Message
+
+        $backupReport += "<h3>Backup Jobs - $server</h3>"
+        if ($backupResults) {
+            $backupReport += $backupResults | ConvertTo-Html -Fragment
+        } else {
+            $backupReport += "<p>No backup job events found.</p>"
+        }
+
+        # --- Network Utilization and Errors ---
+        # Errors
+        try {
+            $netStats = Get-NetAdapterStatistics -CimSession $server | Select-Object Name, OutboundErrors, InboundErrors
+            $networkReport += "<h3>Network Errors - $server</h3>"
+            $networkReport += $netStats | ConvertTo-Html -Fragment
+        } catch {
+            $networkReport += "<h3>Network Errors - $server</h3><p>Could not retrieve network statistics.</p>"
+        }
+        # Utilization
+        try {
+            $netPerf = Get-Counter -ComputerName $server '\Network Interface(*)\Bytes Total/sec'
+            $utilData = $netPerf.CounterSamples | Select-Object InstanceName, @{n="Bytes/sec";e={"{0:N0}" -f $_.CookedValue}}
+            $networkReport += "<h3>Network Utilization - $server</h3>"
+            $networkReport += $utilData | ConvertTo-Html -Fragment
+        } catch {
+            $networkReport += "<h3>Network Utilization - $server</h3><p>Could not retrieve network utilization data.</p>"
+        }
+
     } catch {
         Write-Warning "Failed to connect to $server : $_"
     }
@@ -127,6 +176,9 @@ $htmlBody += $systemReport | ConvertTo-Html -Fragment -PreContent "<h2>System He
 $htmlBody += $vmReport
 $htmlBody += $securityReport
 $htmlBody += $cpuTrendReport
+$htmlBody += $hardwareReport
+$htmlBody += $backupReport
+$htmlBody += $networkReport
 
 $fullReport = ConvertTo-Html -Head $style -Body ($htmlBody -join "") -Title "Daily System Report" |
     ForEach-Object {
